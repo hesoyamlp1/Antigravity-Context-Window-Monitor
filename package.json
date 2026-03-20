@@ -47,6 +47,25 @@
         "title": "Open Context Dump Folder / 打开上下文落盘目录"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravity-context-monitor",
+          "title": "Context Monitor",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "views": {
+      "antigravity-context-monitor": [
+        {
+          "type": "webview",
+          "id": "antigravity-context-monitor.sidebarView",
+          "name": "Context Monitor",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
     "configuration": {
       "title": "Antigravity Context Monitor / 上下文监控设置",
       "properties": {

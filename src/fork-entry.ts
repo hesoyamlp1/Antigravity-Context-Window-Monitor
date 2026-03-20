@@ -12,9 +12,11 @@
 import * as vscode from 'vscode';
 import * as originalExtension from './extension';
 import { discoverLanguageServer, LSInfo } from './discovery';
-import { getAllTrajectories, getContextUsage, normalizeUri, ContextUsage } from './tracker';
+import { getAllTrajectories, getContextUsage, fetchFullUserStatus, normalizeUri, ContextUsage } from './tracker';
 import { dumpConversation, forceDumpConversation, resetDumpState, getDumpDir } from './context-dumper';
 import { CascadeStatus, STEP_BATCH_SIZE } from './constants';
+import { SidebarViewProvider } from './sidebar-view';
+import { ModelConfig } from './models';
 
 // ─── Fork State ───────────────────────────────────────────────────────────────
 
@@ -23,9 +25,14 @@ let dumpTimer: NodeJS.Timeout | undefined;
 let dumpAbortController = new AbortController();
 let forkOutputChannel: vscode.OutputChannel | undefined;
 let cachedLsForDump: LSInfo | null = null;
+let sidebarProvider: SidebarViewProvider | null = null;
+let cachedSidebarConfigs: ModelConfig[] = [];
+let cachedSidebarUserInfo: import('./tracker').UserStatusInfo | null = null;
+let sidebarStatusPollCount = 0;
 
 /** Dump polling interval — slower than the main extension to avoid doubling RPC load. */
 const DUMP_POLL_INTERVAL_MS = 15_000; // 15 seconds
+const SIDEBAR_STATUS_POLL_INTERVAL = 4; // refresh user status every N dump cycles
 
 // ─── Activation Wrapper ──────────────────────────────────────────────────────
 
@@ -36,7 +43,13 @@ export function activate(context: vscode.ExtensionContext): void {
     // 2. Fork additions
     dumpAbortController = new AbortController();
     forkOutputChannel = vscode.window.createOutputChannel('Context Dump (Fork)');
-    forkLog('Fork entry point activated — context dump enabled');
+    forkLog('Fork entry point activated — context dump + sidebar enabled');
+
+    // 3. Register sidebar view provider
+    sidebarProvider = new SidebarViewProvider(context.extensionUri);
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewId, sidebarProvider),
+    );
 
     // Register dump commands
     context.subscriptions.push(
@@ -77,7 +90,7 @@ export function activate(context: vscode.ExtensionContext): void {
         context.subscriptions.push(forkOutputChannel);
     }
 
-    // 3. Start dump polling (independent of main extension's polling)
+    // 4. Start dump polling (independent of main extension's polling)
     scheduleDumpPoll();
 }
 
@@ -110,8 +123,6 @@ function scheduleDumpPoll(): void {
 }
 
 async function dumpPollCycle(): Promise<void> {
-    if (!dumpEnabled) { return; }
-
     const workspaceUri = getWorkspaceUri();
     const signal = dumpAbortController.signal;
 
@@ -142,15 +153,49 @@ async function dumpPollCycle(): Promise<void> {
 
         if (!target) { return; }
 
-        // Get context usage (reuses upstream's getContextUsage — read-only)
+        // Get context usage
         const config = vscode.workspace.getConfiguration('antigravityContextMonitor');
         const customLimits = config.get<Record<string, number>>('contextLimits');
         const usage = await getContextUsage(cachedLsForDump, target, customLimits, signal);
 
         // Dump (incremental — only writes if stepCount changed)
-        const filePath = await dumpConversation(cachedLsForDump, usage, signal);
-        if (filePath) {
-            forkLog(`Dumped: ${target.summary?.substring(0, 30)} (${target.stepCount} steps) → ${filePath}`);
+        if (dumpEnabled) {
+            const filePath = await dumpConversation(cachedLsForDump, usage, signal);
+            if (filePath) {
+                forkLog(`Dumped: ${target.summary?.substring(0, 30)} (${target.stepCount} steps) → ${filePath}`);
+            }
+        }
+
+        // ─── Sidebar Update ───────────────────────────────────────────────
+        if (sidebarProvider) {
+            // Compute usage for recent trajectories (top 5)
+            const scopeTrajectories = qualified.length > 0 ? qualified : trajectories;
+            const recentTrajectories = scopeTrajectories.slice(0, 5);
+            const usagePromises = recentTrajectories.map(async (t) => {
+                if (t.cascadeId === target!.cascadeId) { return usage; }
+                try {
+                    return await getContextUsage(cachedLsForDump!, t, customLimits, signal);
+                } catch { return null; }
+            });
+            const usageResults = await Promise.all(usagePromises);
+            const allUsages = usageResults.filter((u): u is ContextUsage => u !== null);
+
+            // Periodically refresh user status & model configs
+            sidebarStatusPollCount++;
+            if (sidebarStatusPollCount >= SIDEBAR_STATUS_POLL_INTERVAL || !cachedSidebarUserInfo) {
+                sidebarStatusPollCount = 0;
+                try {
+                    const fullStatus = await fetchFullUserStatus(cachedLsForDump, signal);
+                    if (fullStatus) {
+                        cachedSidebarConfigs = fullStatus.configs;
+                        cachedSidebarUserInfo = fullStatus.userInfo;
+                    }
+                } catch {
+                    // Non-critical — keep using cached data
+                }
+            }
+
+            sidebarProvider.update(usage, allUsages, cachedSidebarConfigs, cachedSidebarUserInfo);
         }
     } catch (err) {
         forkLog(`Dump cycle error: ${err}`);
